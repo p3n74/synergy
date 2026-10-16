@@ -274,7 +274,7 @@ def main(argv: list[str] | None = None) -> None:
             if remote["skip_delta"]:
                 remote["skip_delta"] = False
                 return None
-            link.send({"t": "mouse", "dx": dx * speed, "dy": -dy * speed})
+            link.send({"t": "mouse", "dx": dx * speed, "dy": dy * speed})
             return None
 
         if not remote["on"]:
