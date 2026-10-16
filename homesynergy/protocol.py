@@ -56,6 +56,13 @@ def _recvall(sock: socket.socket, n: int) -> bytes | None:
     return bytes(buf)
 
 
+def tune_socket(sock: socket.socket) -> None:
+    """Keep small input packets from sitting in a kernel buffer."""
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+
+
 def send_obj(sock: socket.socket, token: str, obj: dict) -> None:
     sock.sendall(encode_frame(token, obj))
 

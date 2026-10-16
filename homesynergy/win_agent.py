@@ -17,7 +17,7 @@ from ctypes import wintypes
 
 from .config import load_config
 from .keys import EXTENDED_VKS
-from .protocol import AuthError, ProtocolError, recv_obj, send_obj
+from .protocol import AuthError, ProtocolError, recv_obj, send_obj, tune_socket
 from .session import RemotePointer
 
 
@@ -71,7 +71,7 @@ def serve(cfg: dict) -> None:
             conn.close()
             continue
         log(f"peer {peer}")
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        tune_socket(conn)
         conn.settimeout(8)
         try:
             _serve_client(conn, cfg, user32, kernel32, pointer, held, held_lock, clip_seq, geometry)
@@ -167,7 +167,7 @@ def _handle(msg, send, user32, kernel32, pointer, held, held_lock, clip_seq) -> 
 
 
 def _clipboard_loop(send, user32, kernel32, clip_seq, stop: threading.Event) -> None:
-    while not stop.wait(0.4):
+    while not stop.wait(0.05):
         seq = _clipboard_sequence(user32)
         if seq == clip_seq["n"]:
             continue

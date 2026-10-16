@@ -7,6 +7,7 @@ Input injection runs only after the Windows agent accepts the shared token.
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import signal
 import socket
@@ -17,12 +18,18 @@ import time
 from .config import load_config
 from .edge import quartz_y_from_frac, should_cross_out, y_frac_from_quartz
 from .keys import is_modifier, mac_to_vk
-from .protocol import DEFAULT_PORT, AuthError, ProtocolError, recv_obj, send_obj
+from .protocol import DEFAULT_PORT, AuthError, ProtocolError, recv_obj, send_obj, tune_socket
+
+# Gather a fast swipe into one packet. Slow moves still leave within a frame.
+MOUSE_BATCH = 0.008
+CLIPBOARD_INTERVAL = 0.05
 
 HOTKEY_MOD_CTRL = 0x00040000
 HOTKEY_MOD_ALT = 0x00080000
 MAC_RIGHT = 124
 MAC_LEFT = 123
+MAC_ESCAPE = 53
+PID_PATH = __import__("pathlib").Path.home() / ".homesynergy" / "agent.pid"
 
 
 def log(msg: str) -> None:
@@ -37,19 +44,33 @@ class Link:
         self.geometry: dict | None = None
         self.connected = threading.Event()
         self.inbox: queue.Queue = queue.Queue()
-        self.outbox: queue.Queue = queue.Queue(maxsize=512)
+        self.cv = threading.Condition()
+        self.events: list[dict] = []
+        self.pending_dx = 0.0
+        self.pending_dy = 0.0
 
     def send(self, obj: dict) -> None:
-        kind = obj.get("t")
-        try:
-            self.outbox.put_nowait(obj)
-        except queue.Full:
-            if kind != "mouse":
-                try:
-                    self.outbox.get_nowait()
-                    self.outbox.put_nowait(obj)
-                except queue.Empty:
-                    pass
+        with self.cv:
+            if obj.get("t") == "mouse":
+                self.pending_dx += float(obj["dx"])
+                self.pending_dy += float(obj["dy"])
+            else:
+                self.events.append(obj)
+            self.cv.notify()
+
+    def take_batch(self) -> tuple[float, float, list[dict]]:
+        """Mouse waits a few milliseconds so a swipe is one move. Keys do not."""
+        with self.cv:
+            if not self.events and not self.pending_dx and not self.pending_dy:
+                self.cv.wait(0.5)
+            if not self.events and (self.pending_dx or self.pending_dy):
+                self.cv.wait(MOUSE_BATCH)
+            dx, dy = self.pending_dx, self.pending_dy
+            self.pending_dx = 0.0
+            self.pending_dy = 0.0
+            events = self.events
+            self.events = []
+        return dx, dy, events
 
     def close(self) -> None:
         with self.lock:
@@ -67,29 +88,34 @@ class Link:
 
 def _writer(link: Link, stop: threading.Event) -> None:
     while not stop.is_set():
-        try:
-            obj = link.outbox.get(timeout=0.2)
-        except queue.Empty:
-            continue
-        with link.lock:
-            sock = link.sock
-        if sock is None:
-            continue
-        try:
-            send_obj(sock, link.token, obj)
-        except OSError as exc:
-            log(f"send failed: {exc}")
-            link.close()
+        dx, dy, events = link.take_batch()
+        if stop.is_set():
+            break
+        outgoing: list[dict] = []
+        if dx or dy:
+            outgoing.append({"t": "mouse", "dx": dx, "dy": dy})
+        outgoing.extend(events)
+        for obj in outgoing:
+            with link.lock:
+                sock = link.sock
+            if sock is None:
+                break
+            try:
+                send_obj(sock, link.token, obj)
+            except OSError as exc:
+                log(f"send failed: {exc}")
+                link.close()
+                break
 
 
-def _connect_loop(link: Link, cfg: dict, stop: threading.Event) -> None:
+def _connect_loop(link: Link, cfg: dict, stop: threading.Event, wake_main) -> None:
     host = cfg["windows_host"]
     port = int(cfg["port"])
     while not stop.is_set():
         try:
             log(f"connecting to {host}:{port}")
             sock = socket.create_connection((host, port), timeout=5)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            tune_socket(sock)
             sock.settimeout(None)
             send_obj(sock, link.token, {"t": "hello", "v": 1, "name": "mac"})
             reply = recv_obj(sock, link.token)
@@ -109,6 +135,7 @@ def _connect_loop(link: Link, cfg: dict, stop: threading.Event) -> None:
                 if msg is None:
                     break
                 link.inbox.put(msg)
+                wake_main()
         except AuthError as exc:
             log(f"auth failed: {exc}")
         except (OSError, ProtocolError, TimeoutError) as exc:
@@ -157,7 +184,8 @@ def main(argv: list[str] | None = None) -> None:
     command_is_control = bool(cfg["command_is_control"])
     link = Link(cfg["token"])
     stop = threading.Event()
-    remote = {"on": False, "skip_delta": False}
+    remote = {"on": False, "skip_delta": False, "hold_until": 0.0}
+    reset_requested = {"on": False}
     held_mods: set[int] = set()
     last_clip = {"text": None, "change": None}
     display = {"right": 0.0, "origin_y": 0.0, "height": 1.0}
@@ -189,14 +217,38 @@ def main(argv: list[str] | None = None) -> None:
     def y_frac_at(quartz_y: float) -> float:
         return y_frac_from_quartz(quartz_y, display["origin_y"], display["height"])
 
+    def force_local() -> None:
+        """Return the pointer to the Mac even if the handoff never started moving."""
+        remote["on"] = False
+        remote["skip_delta"] = False
+        remote["hold_until"] = time.time() + 0.6
+        Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+        if tap_holder[0] is not None:
+            Quartz.CGEventTapEnable(tap_holder[0], True)
+        bounds = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
+        Quartz.CGWarpMouseCursorPosition(
+            Quartz.CGPointMake(
+                bounds.origin.x + bounds.size.width / 2,
+                bounds.origin.y + bounds.size.height / 2,
+            )
+        )
+        link.send({"t": "leave"})
+        for code in list(held_mods):
+            vk = mac_to_vk(code, command_is_control)
+            if vk is not None:
+                link.send({"t": "key", "down": False, "vk": vk, "mac": code})
+        held_mods.clear()
+        log("failsafe: pointer back on mac")
+
     def release_remote(y_frac: float | None = None) -> None:
         if not remote["on"]:
+            Quartz.CGAssociateMouseAndMouseCursorPosition(True)
             return
         remote["on"] = False
         Quartz.CGAssociateMouseAndMouseCursorPosition(True)
         if y_frac is not None:
             y = quartz_y_from_frac(y_frac, display["origin_y"], display["height"])
-            Quartz.CGWarpMouseCursorPosition(Quartz.CGPointMake(display["right"] - 2, y))
+            Quartz.CGWarpMouseCursorPosition(Quartz.CGPointMake(display["right"] - 20, y))
         for code in list(held_mods):
             vk = mac_to_vk(code, command_is_control)
             if vk is not None:
@@ -252,6 +304,10 @@ def main(argv: list[str] | None = None) -> None:
         flags = int(Quartz.CGEventGetFlags(event))
         hotkey = flags & HOTKEY_MOD_CTRL and flags & HOTKEY_MOD_ALT
 
+        if reset_requested["on"] or (event_type == Quartz.kCGEventKeyDown and hotkey and keycode == MAC_ESCAPE):
+            reset_requested["on"] = False
+            force_local()
+            return None
         if event_type == Quartz.kCGEventKeyDown and hotkey and keycode == MAC_RIGHT:
             loc = Quartz.CGEventGetLocation(event)
             enter_remote(loc.y)
@@ -267,7 +323,11 @@ def main(argv: list[str] | None = None) -> None:
             dx = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaX))
             dy = float(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaY))
             if not remote["on"]:
-                if cfg["edge"] == "right" and should_cross_out(loc.x, dx, display["right"], edge_px):
+                if (
+                    time.time() >= remote["hold_until"]
+                    and cfg["edge"] == "right"
+                    and should_cross_out(loc.x, dx, display["right"], edge_px)
+                ):
                     enter_remote(loc.y)
                     return None
                 return event
@@ -326,6 +386,9 @@ def main(argv: list[str] | None = None) -> None:
         return None
 
     def poll(_timer) -> None:
+        if reset_requested["on"]:
+            reset_requested["on"] = False
+            force_local()
         while True:
             try:
                 msg = link.inbox.get_nowait()
@@ -410,7 +473,8 @@ def main(argv: list[str] | None = None) -> None:
             f"{sys.executable}"
         )
         raise SystemExit(1)
-    tap_holder = [tap]
+    tap_holder = [None]
+    tap_holder[0] = tap
     source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
     Quartz.CFRunLoopAddSource(
         Quartz.CFRunLoopGetCurrent(),
@@ -428,28 +492,54 @@ def main(argv: list[str] | None = None) -> None:
     )
     del wake_observer, NSObject, NSScreen
 
-    timer = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.3, True, poll)
-    NSRunLoop.currentRunLoop().addTimer_forMode_(timer, "NSDefaultRunLoopMode")
+    timer = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(CLIPBOARD_INTERVAL, True, poll)
+    NSRunLoop.currentRunLoop().addTimer_forMode_(timer, "NSRunLoopCommonModes")
+    Quartz.CGSetLocalEventsSuppressionInterval(0.0)
+
+    main_loop = Quartz.CFRunLoopGetCurrent()
+
+    def wake_main() -> None:
+        Quartz.CFRunLoopPerformBlock(main_loop, Quartz.kCFRunLoopCommonModes, lambda: poll(None))
+        Quartz.CFRunLoopWakeUp(main_loop)
 
     threading.Thread(target=_writer, args=(link, stop), name="hs-writer", daemon=True).start()
-    threading.Thread(target=_connect_loop, args=(link, cfg, stop), name="hs-link", daemon=True).start()
+    threading.Thread(
+        target=_connect_loop,
+        args=(link, cfg, stop, wake_main),
+        name="hs-link",
+        daemon=True,
+    ).start()
     threading.Thread(target=_keepalive, args=(link, stop), name="hs-ping", daemon=True).start()
 
     log(f"watching the right edge for {cfg['windows_host']}:{cfg.get('port', DEFAULT_PORT)}")
-    log("control+option+right jumps immediately, control+option+left comes back")
+    log("control+option+right jumps, control+option+left or control+option+escape comes back")
+    log("or run: synergy reset")
 
     def stop_loop(signum, frame):
         del signum, frame
         Quartz.CFRunLoopStop(Quartz.CFRunLoopGetCurrent())
 
+    def request_reset(signum, frame):
+        del signum, frame
+        reset_requested["on"] = True
+        Quartz.CFRunLoopPerformBlock(main_loop, Quartz.kCFRunLoopCommonModes, lambda: poll(None))
+        Quartz.CFRunLoopWakeUp(main_loop)
+
+    PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PID_PATH.write_text(str(os.getpid()))
+
     signal.signal(signal.SIGINT, stop_loop)
     signal.signal(signal.SIGTERM, stop_loop)
+    signal.signal(signal.SIGUSR1, request_reset)
     try:
         Quartz.CFRunLoopRun()
     finally:
         stop.set()
+        with link.cv:
+            link.cv.notify_all()
         release_remote(None)
         link.close()
+        PID_PATH.unlink(missing_ok=True)
 
 
 def _keepalive(link: Link, stop: threading.Event) -> None:
