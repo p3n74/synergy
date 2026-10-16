@@ -4,6 +4,12 @@ Use the Mac keyboard, trackpad, and clipboard on the Windows PC at `172.20.20.24
 
 The Mac is the computer you type on. The Windows PC stays logged in. When you open the laptop, the Mac agent starts, connects, and waits. Push the pointer off the right edge of the Mac display and it continues on the Windows desktop. Push back through the left edge and you are on the Mac again. Copied text follows you.
 
+## Start
+
+On the Mac, double-click `Start Mac.command`. The first time, that installs the login agent. After that it starts when you open the laptop, and the same file starts it again if you quit it.
+
+On Windows, double-click `Start Windows.bat`. Leave that window open. To make it start at each logon, double-click `Install Windows.bat` once and approve the prompt. Copy `~/.homesynergy/config.json` from the Mac to `%USERPROFILE%\.homesynergy\config.json` before either of those.
+
 ## What the installed share app is doing
 
 Synergy is not installed on this Mac. ShareMouse is, and it is the same kind of tool. REA traced the app without running it:
